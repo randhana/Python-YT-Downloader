@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YouTube Playlist -> MP3 downloader (GUI, with a download queue).
+YouTube Playlist -> Audio downloader (GUI, with a download queue).
 
 Features
 --------
@@ -71,7 +71,7 @@ class DownloaderApp:
         self.current_id = None
         self._last_push = 0.0
 
-        root.title("YouTube Playlist → MP3  (queue)")
+        root.title("YouTube Playlist → Audio  (queue)")
         root.geometry("820x680")
         root.minsize(660, 560)
         pad = {"padx": 8, "pady": 4}
