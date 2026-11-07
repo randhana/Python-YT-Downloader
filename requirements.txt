@@ -1,1 +1,2 @@
 yt-dlp>=2026.10.26
+mutagen>=1.47          # for embedding cover art / tags in flac, opus, m4a, mp3

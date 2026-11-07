@@ -97,11 +97,17 @@ class DownloaderApp:
 
         tk.Label(root, text="MP3 quality:").grid(
             row=2, column=0, sticky="w", **pad)
+        self.format_var = tk.StringVar(value="mp3")
         self.quality_var = tk.StringVar(value="320")
         self.parallel_var = tk.StringVar(value="3")
         qframe = tk.Frame(root)
         qframe.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
-        ttk.Combobox(qframe, textvariable=self.quality_var, width=8,
+        tk.Label(qframe, text="Format:").pack(side="left")
+        ttk.Combobox(qframe, textvariable=self.format_var, width=6,
+                     state="readonly",
+                     values=["mp3", "m4a", "opus", "flac", "wav"]).pack(
+            side="left", padx=(4, 10))
+        ttk.Combobox(qframe, textvariable=self.quality_var, width=6,
                      state="readonly",
                      values=["320", "256", "192", "128"]).pack(side="left")
         tk.Label(qframe, text="kbps").pack(side="left", padx=6)
@@ -338,9 +344,10 @@ class DownloaderApp:
             return
         self.stop_event.clear()
         self.pause_event.set()
-        self.worker = threading.Thread(target=self.run_queue,
-                                       args=(folder, self.quality_var.get()),
-                                       daemon=True)
+        self.worker = threading.Thread(
+            target=self.run_queue,
+            args=(folder, self.quality_var.get(), self.format_var.get()),
+            daemon=True)
         self.worker.start()
         self.log_msg("▶ Queue started.")
         self.put("buttons")
@@ -405,7 +412,7 @@ class DownloaderApp:
         more = f"   (+{len(rows) - 4} more)" if len(rows) > 4 else ""
         self.put("track", "   " + "     ".join(parts) + more)
 
-    def run_queue(self, base_folder, quality):
+    def run_queue(self, base_folder, quality, audio_format):
         try:
             while not self.stop_event.is_set():
                 # pause between items
@@ -415,13 +422,12 @@ class DownloaderApp:
                 with self.lock:
                     item = next((x for x in self.items
                                  if x["status"] == self.QUEUED), None)
-                    queued_left = sum(1 for x in self.items
-                                      if x["status"] == self.QUEUED)
                     total_items = len(self.items)
                 if item is None:
                     break
                 self.current_id = item["id"]
-                self._process_item(item, base_folder, quality, total_items)
+                self._process_item(item, base_folder, quality, audio_format,
+                                   total_items)
         except StopWorker:
             pass
         except Exception as exc:  # noqa: BLE001
@@ -446,7 +452,8 @@ class DownloaderApp:
         while not self.pause_event.is_set() and not self.stop_event.is_set():
             time.sleep(0.15)
 
-    def _process_item(self, item, base_folder, quality, total_items):
+    def _process_item(self, item, base_folder, quality, audio_format,
+                      total_items):
         item["status"] = self.RUNNING
         item["done"] = 0
         item["errors"] = 0
@@ -491,7 +498,17 @@ class DownloaderApp:
         item["total"] = len(entries)
         self.put("refresh")
         self.log_msg(f"   📁 Saving to: {target}")
-        self.log_msg(f"   🎵 {len(entries)} track(s) found.")
+        self.log_msg(f"   🎵 {len(entries)} track(s) as {audio_format.upper()}.")
+
+        # Format-aware post-processing. Lossless formats ignore the bitrate.
+        thumb_ok = audio_format in ("mp3", "m4a", "opus", "flac")
+        postprocessors = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": audio_format,
+             "preferredquality": quality},
+            {"key": "FFmpegMetadata"},
+        ]
+        if thumb_ok:
+            postprocessors.append({"key": "EmbedThumbnail"})
 
         ydl_opts = {
             "format": "bestaudio/best",
@@ -503,14 +520,11 @@ class DownloaderApp:
             "noprogress": True,             # we show progress in the GUI instead
             "continuedl": True,
             "concurrent_fragment_downloads": 4,   # speeds up each file (DASH/HLS)
-            "download_archive": os.path.join(target, ".downloaded.txt"),
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
-                 "preferredquality": quality},
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail"},
-            ],
-            "writethumbnail": True,
+            # separate archive per format so switching format re-downloads
+            "download_archive": os.path.join(
+                target, f".downloaded-{audio_format}.txt"),
+            "postprocessors": postprocessors,
+            "writethumbnail": thumb_ok,
         }
 
         total = len(entries)
