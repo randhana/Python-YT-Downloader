@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YouTube Playlist -> Audio downloader (GUI, with a download queue).
+YouTube Playlist downloader (GUI, with a download queue): audio or video.
 
 Features
 --------
@@ -71,7 +71,7 @@ class DownloaderApp:
         self.current_id = None
         self._last_push = 0.0
 
-        root.title("YouTube Playlist → Audio  (queue)")
+        root.title("YouTube Playlist Downloader  (queue)")
         root.geometry("820x680")
         root.minsize(660, 560)
         pad = {"padx": 8, "pady": 4}
@@ -99,18 +99,24 @@ class DownloaderApp:
             row=2, column=0, sticky="w", **pad)
         self.format_var = tk.StringVar(value="mp3")
         self.quality_var = tk.StringVar(value="320")
+        self.resolution_var = tk.StringVar(value="720")
         self.parallel_var = tk.StringVar(value="3")
         qframe = tk.Frame(root)
         qframe.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
         tk.Label(qframe, text="Format:").pack(side="left")
         ttk.Combobox(qframe, textvariable=self.format_var, width=6,
                      state="readonly",
-                     values=["mp3", "m4a", "opus", "flac", "wav"]).pack(
+                     values=["mp3", "m4a", "opus", "flac", "wav", "mp4"]).pack(
             side="left", padx=(4, 10))
         ttk.Combobox(qframe, textvariable=self.quality_var, width=6,
                      state="readonly",
                      values=["320", "256", "192", "128"]).pack(side="left")
-        tk.Label(qframe, text="kbps").pack(side="left", padx=6)
+        tk.Label(qframe, text="kbps (audio)").pack(side="left", padx=6)
+        ttk.Combobox(qframe, textvariable=self.resolution_var, width=6,
+                     state="readonly",
+                     values=["best", "2160", "1440", "1080", "720", "480",
+                             "360"]).pack(side="left")
+        tk.Label(qframe, text="p (mp4)").pack(side="left", padx=6)
         tk.Label(qframe, text="    Parallel:").pack(side="left")
         ttk.Combobox(qframe, textvariable=self.parallel_var, width=5,
                      state="readonly",
@@ -346,7 +352,8 @@ class DownloaderApp:
         self.pause_event.set()
         self.worker = threading.Thread(
             target=self.run_queue,
-            args=(folder, self.quality_var.get(), self.format_var.get()),
+            args=(folder, self.quality_var.get(), self.format_var.get(),
+                  self.resolution_var.get()),
             daemon=True)
         self.worker.start()
         self.log_msg("▶ Queue started.")
@@ -412,7 +419,7 @@ class DownloaderApp:
         more = f"   (+{len(rows) - 4} more)" if len(rows) > 4 else ""
         self.put("track", "   " + "     ".join(parts) + more)
 
-    def run_queue(self, base_folder, quality, audio_format):
+    def run_queue(self, base_folder, quality, audio_format, resolution):
         try:
             while not self.stop_event.is_set():
                 # pause between items
@@ -427,7 +434,7 @@ class DownloaderApp:
                     break
                 self.current_id = item["id"]
                 self._process_item(item, base_folder, quality, audio_format,
-                                   total_items)
+                                   resolution, total_items)
         except StopWorker:
             pass
         except Exception as exc:  # noqa: BLE001
@@ -453,7 +460,7 @@ class DownloaderApp:
             time.sleep(0.15)
 
     def _process_item(self, item, base_folder, quality, audio_format,
-                      total_items):
+                      resolution, total_items):
         item["status"] = self.RUNNING
         item["done"] = 0
         item["errors"] = 0
@@ -498,20 +505,9 @@ class DownloaderApp:
         item["total"] = len(entries)
         self.put("refresh")
         self.log_msg(f"   📁 Saving to: {target}")
-        self.log_msg(f"   🎵 {len(entries)} track(s) as {audio_format.upper()}.")
 
-        # Format-aware post-processing. Lossless formats ignore the bitrate.
-        thumb_ok = audio_format in ("mp3", "m4a", "opus", "flac")
-        postprocessors = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": audio_format,
-             "preferredquality": quality},
-            {"key": "FFmpegMetadata"},
-        ]
-        if thumb_ok:
-            postprocessors.append({"key": "EmbedThumbnail"})
-
-        ydl_opts = {
-            "format": "bestaudio/best",
+        # options shared by audio and video
+        common = {
             "outtmpl": os.path.join(target, "%(title)s.%(ext)s"),
             "ignoreerrors": False,          # per-track; we catch failures ourselves
             "nocheckcertificate": True,
@@ -520,12 +516,55 @@ class DownloaderApp:
             "noprogress": True,             # we show progress in the GUI instead
             "continuedl": True,
             "concurrent_fragment_downloads": 4,   # speeds up each file (DASH/HLS)
-            # separate archive per format so switching format re-downloads
-            "download_archive": os.path.join(
-                target, f".downloaded-{audio_format}.txt"),
-            "postprocessors": postprocessors,
-            "writethumbnail": thumb_ok,
         }
+
+        if audio_format == "mp4":
+            # ---- VIDEO (mp4) ----
+            if resolution == "best":
+                # prefer H.264 (avc1) for compatibility, else any best
+                fmt_sel = ("bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
+                           "bestvideo*+bestaudio/best")
+                tag, nice = "mp4-best", "MP4 (best)"
+            else:
+                r = resolution
+                fmt_sel = (
+                    f"bestvideo[height<={r}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<={r}]+bestaudio/"
+                    f"best[height<={r}]/best")
+                tag, nice = f"mp4-{r}", f"MP4 {r}p"
+            ydl_opts = {
+                **common,
+                "format": fmt_sel,
+                "merge_output_format": "mp4",
+                "download_archive": os.path.join(target, f".downloaded-{tag}.txt"),
+                "postprocessors": [
+                    {"key": "FFmpegMetadata"},
+                    {"key": "EmbedThumbnail"},
+                ],
+                "writethumbnail": True,
+            }
+        else:
+            # ---- AUDIO ----  (lossless formats ignore the bitrate)
+            thumb_ok = audio_format in ("mp3", "m4a", "opus", "flac")
+            nice = audio_format.upper()
+            postprocessors = [
+                {"key": "FFmpegExtractAudio", "preferredcodec": audio_format,
+                 "preferredquality": quality},
+                {"key": "FFmpegMetadata"},
+            ]
+            if thumb_ok:
+                postprocessors.append({"key": "EmbedThumbnail"})
+            ydl_opts = {
+                **common,
+                "format": "bestaudio/best",
+                # separate archive per format so switching format re-downloads
+                "download_archive": os.path.join(
+                    target, f".downloaded-{audio_format}.txt"),
+                "postprocessors": postprocessors,
+                "writethumbnail": thumb_ok,
+            }
+
+        self.log_msg(f"   🎬 {len(entries)} item(s) as {nice}.")
 
         total = len(entries)
         parallel = max(1, int(self.parallel_var.get() or "1"))
