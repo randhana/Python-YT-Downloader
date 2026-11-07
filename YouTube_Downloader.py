@@ -23,6 +23,7 @@ import re
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -68,6 +69,7 @@ class DownloaderApp:
         self.pause_event.set()
         self.stop_event = threading.Event()
         self.current_id = None
+        self._last_push = 0.0
 
         root.title("YouTube Playlist → MP3  (queue)")
         root.geometry("820x680")
@@ -96,12 +98,19 @@ class DownloaderApp:
         tk.Label(root, text="MP3 quality:").grid(
             row=2, column=0, sticky="w", **pad)
         self.quality_var = tk.StringVar(value="320")
+        self.parallel_var = tk.StringVar(value="3")
         qframe = tk.Frame(root)
-        qframe.grid(row=2, column=1, sticky="w", **pad)
+        qframe.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
         ttk.Combobox(qframe, textvariable=self.quality_var, width=8,
                      state="readonly",
                      values=["320", "256", "192", "128"]).pack(side="left")
         tk.Label(qframe, text="kbps").pack(side="left", padx=6)
+        tk.Label(qframe, text="    Parallel:").pack(side="left")
+        ttk.Combobox(qframe, textvariable=self.parallel_var, width=5,
+                     state="readonly",
+                     values=["1", "2", "3", "4", "5", "6", "8", "10"]).pack(
+            side="left", padx=6)
+        tk.Label(qframe, text="tracks at once").pack(side="left")
 
         # ---------------- control row ----------------
         ctl = tk.Frame(root)
@@ -353,21 +362,48 @@ class DownloaderApp:
         self.put("buttons")
 
     # ================= worker =================
-    def _progress_hook(self, d):
-        if d["status"] == "downloading":
-            if self.stop_event.is_set() or not self.pause_event.is_set():
+    def _make_hook(self, active, active_lock):
+        """Build a progress hook shared by all concurrent downloads."""
+        def hook(d):
+            if (self.stop_event.is_set() or not self.pause_event.is_set()) \
+                    and d["status"] == "downloading":
                 raise yt_dlp.utils.DownloadCancelled()
-            total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            done = d.get("downloaded_bytes", 0)
-            if total:
-                self.put("song", done / total * 100)
-            speed = (d.get("_speed_str") or "").strip()
-            eta = (d.get("_eta_str") or "").strip()
-            size = f"{human(done)}/{human(total)}" if total else human(done)
-            self.put("track", f"      {size}   {speed}   ETA {eta}")
-        elif d["status"] == "finished":
-            self.put("song", 100)
-            self.put("track", "      Converting to MP3…")
+            info = d.get("info_dict") or {}
+            tid = info.get("id") or info.get("title") or id(d)
+            title = info.get("title") or str(tid)
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                done = d.get("downloaded_bytes", 0)
+                pct = (done / total * 100) if total else 0.0
+                with active_lock:
+                    active[tid] = [title, pct, "dl"]
+            elif d["status"] == "finished":
+                with active_lock:
+                    active[tid] = [title, 100.0, "conv"]  # now converting
+            self._refresh_activity(active, active_lock)
+        return hook
+
+    def _refresh_activity(self, active, active_lock, force=False):
+        """Summarise all in-flight tracks into the activity panel (throttled)."""
+        now = time.monotonic()
+        if not force and (now - self._last_push) < 0.2:
+            return
+        self._last_push = now
+        with active_lock:
+            rows = list(active.values())
+        if not rows:
+            self.put("song", 0)
+            self.put("track", "")
+            return
+        avg = sum(r[1] for r in rows) / len(rows)
+        self.put("song", avg)
+        parts = []
+        for title, pct, state in rows[:4]:
+            t = (title[:32] + "…") if len(title) > 33 else title
+            parts.append(f"⚙ converting {t}" if state == "conv"
+                         else f"⬇ {pct:3.0f}% {t}")
+        more = f"   (+{len(rows) - 4} more)" if len(rows) > 4 else ""
+        self.put("track", "   " + "     ".join(parts) + more)
 
     def run_queue(self, base_folder, quality):
         try:
@@ -460,13 +496,14 @@ class DownloaderApp:
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(target, "%(title)s.%(ext)s"),
-            "ignoreerrors": True,
+            "ignoreerrors": False,          # per-track; we catch failures ourselves
             "nocheckcertificate": True,
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,             # we show progress in the GUI instead
             "continuedl": True,
+            "concurrent_fragment_downloads": 4,   # speeds up each file (DASH/HLS)
             "download_archive": os.path.join(target, ".downloaded.txt"),
-            "progress_hooks": [self._progress_hook],
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
                  "preferredquality": quality},
@@ -477,72 +514,89 @@ class DownloaderApp:
         }
 
         total = len(entries)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            for idx, entry in enumerate(entries, 1):
-                if self.stop_event.is_set():
-                    item["status"] = self.QUEUED   # resume later (archive skips done)
-                    self.put("refresh")
-                    raise StopWorker
-                title = entry.get("title") or entry.get("id") or "unknown"
-                vurl = (entry.get("webpage_url") or entry.get("url")
-                        or entry.get("id"))
+        parallel = max(1, int(self.parallel_var.get() or "1"))
+        active, active_lock = {}, threading.Lock()
 
-                self.put("now", f"{item['name']}   ·   track {idx}/{total}")
-                self.put("track", f"   ♪  {title}")
-                self.put("song", 0)
-                self.put("overall_text",
-                         f"Playlist progress: track {idx} of {total}   "
-                         f"·   {item['done']} saved, {item['errors']} error(s)")
-                self.put("overall", (idx - 1) / total * 100)
-                self.log_msg(f"   [{idx}/{total}] {title}")
-
-                ok = self._download_one(ydl, vurl, title)
-                if ok == "stopped":
-                    item["status"] = self.QUEUED
-                    self.put("refresh")
-                    raise StopWorker
-                elif ok:
-                    item["done"] += 1
-                else:
-                    item["errors"] += 1
-                self.put("refresh")
-                self.put("overall", idx / total * 100)
-
-        item["status"] = self.DONE
-        self.put("overall", 100)
-        self.put("overall_text",
-                 f"Playlist done: {item['done']} ok, {item['errors']} error(s)")
-        self.log_msg(f"   ✅ '{item['name']}': {item['done']} saved, "
-                     f"{item['errors']} error(s).")
-        self.put("refresh")
-
-    def _download_one(self, ydl, vurl, title):
-        """Download one track. Returns True/False, or 'stopped'. Pause-aware."""
-        while True:
-            if self.stop_event.is_set():
-                return "stopped"
-            try:
-                ydl.download([vurl])
-                self.log_msg(f"        ✓ saved")
-                return True
-            except yt_dlp.utils.DownloadCancelled:
-                if self.stop_event.is_set():
-                    return "stopped"
-                # paused mid-track: wait, then retry (resumes the partial file)
-                self.put("now", "Paused.")
-                self.log_msg("        ⏸ paused — waiting to resume…")
-                self.put("buttons")
+        def download_track(entry):
+            """Download + convert ONE track. Pause/stop aware. Runs in a worker."""
+            title = entry.get("title") or entry.get("id") or "unknown"
+            vurl = (entry.get("webpage_url") or entry.get("url")
+                    or entry.get("id"))
+            tid = entry.get("id") or title
+            opts = dict(ydl_opts)
+            opts["progress_hooks"] = [self._make_hook(active, active_lock)]
+            while True:
+                # hold off starting a new track while paused
                 while (not self.pause_event.is_set()
                        and not self.stop_event.is_set()):
                     time.sleep(0.15)
                 if self.stop_event.is_set():
-                    return "stopped"
-                self.log_msg("        ⏵ resuming…")
-                self.put("buttons")
-                # loop retries the same track
-            except Exception as exc:  # noqa: BLE001
-                self.log_msg(f"        ✗ failed: {exc}")
-                return False
+                    return ("stopped", title)
+                try:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        ret = ydl.download([vurl])
+                    with active_lock:
+                        active.pop(tid, None)
+                    return ("ok", title) if ret == 0 else ("error", title)
+                except yt_dlp.utils.DownloadCancelled:
+                    with active_lock:
+                        active.pop(tid, None)
+                    if self.stop_event.is_set():
+                        return ("stopped", title)
+                    continue  # paused: loop waits, then retries (resumes partial)
+                except Exception as exc:  # noqa: BLE001
+                    with active_lock:
+                        active.pop(tid, None)
+                    self.log_msg(f"      ✗ {title}: {exc}")
+                    return ("error", title)
+
+        self.log_msg(f"   ⏬ Downloading {total} track(s), "
+                     f"{parallel} at a time (converts overlap downloads)…")
+        self.put("now", f"{item['name']}   ·   0/{total} done")
+        self.put("overall", 0)
+
+        stopped = False
+        ex = ThreadPoolExecutor(max_workers=parallel)
+        futures = [ex.submit(download_track, e) for e in entries]
+        try:
+            for fut in as_completed(futures):
+                status, title = fut.result()
+                if status == "ok":
+                    item["done"] += 1
+                    self.log_msg(f"      ✓ {title}")
+                elif status == "error":
+                    item["errors"] += 1
+                elif status == "stopped":
+                    stopped = True
+                completed = item["done"] + item["errors"]
+                self.put("overall", completed / total * 100)
+                self.put("overall_text",
+                         f"Playlist progress: {completed} of {total} finished"
+                         f"   ·   {item['done']} saved, {item['errors']} error(s)")
+                self.put("now",
+                         f"{item['name']}   ·   {item['done']}/{total} done"
+                         + (f", {item['errors']} err" if item["errors"] else ""))
+                self.put("refresh")
+                if self.stop_event.is_set():
+                    stopped = True
+                    break
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+        if stopped or self.stop_event.is_set():
+            item["status"] = self.QUEUED   # resume later (archive skips finished)
+            self.put("refresh")
+            raise StopWorker
+
+        item["status"] = self.DONE
+        self.put("song", 0)
+        self.put("track", "")
+        self.put("overall", 100)
+        self.put("overall_text",
+                 f"Playlist done: {item['done']} saved, {item['errors']} error(s)")
+        self.log_msg(f"   ✅ '{item['name']}': {item['done']} saved, "
+                     f"{item['errors']} error(s).")
+        self.put("refresh")
 
 
 def main():
